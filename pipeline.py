@@ -54,27 +54,46 @@ def supabase_conn():
 # ---------------------------------------------------------------------------
 
 # Column mapping: scraper field  ->  our race_entries column.
+#
+# Real schema (from PuntersEdgeScraper App.config / Module1.vb):
+#   Database : PuntersEdge  (AWS RDS SQL Server)
+#   TodaysRaces  — Meeting, RaceTime, Horse, Odds, BookMaker
+#   BetFairData  — Meeting, RaceTime, Horse, SelectionID, LastTradedprice,
+#                  Market_TotalMatched, selection_TotalMatched
+#   Results      — Meeting, RaceTime, Horse, Result
+#
+# Form columns (barrier, jockey, trainer, weight, last_start_date,
+# track_condition) are NOT captured by the scraper — they remain NULL and
+# the model's form features activate once a form-data source populates them.
 SCRAPER_QUERY = """
     SELECT
-        Meeting            AS meeting,
-        RaceNumber         AS race_number,
-        RaceTime           AS race_time,
-        Distance           AS distance,
-        TrackCondition     AS track_condition,
-        Horse              AS horse,
-        Barrier            AS barrier,
-        Jockey             AS jockey,
-        Trainer            AS trainer,
-        Weight             AS weight,
-        LastStartDate      AS last_start_date,
-        Odds               AS odds,
-        BookMaker          AS bookmaker,
-        selectionId        AS selection_id,
-        LastTradedprice    AS last_traded_price,
-        Market_TotalMatched AS total_matched,
-        status             AS status,
-        Result             AS result
-    FROM dbo.RaceData
+        t.Meeting                    AS meeting,
+        -- RaceNumber is not stored by the scraper; derive a stable int from time.
+        -- Use 0 as a placeholder; adjust below if you add a RaceNumber column.
+        0                            AS race_number,
+        t.RaceTime                   AS race_time,
+        NULL                         AS distance,
+        NULL                         AS track_condition,
+        t.Horse                      AS horse,
+        NULL                         AS barrier,
+        NULL                         AS jockey,
+        NULL                         AS trainer,
+        NULL                         AS weight,
+        NULL                         AS last_start_date,
+        t.Odds                       AS odds,
+        t.BookMaker                  AS bookmaker,
+        b.SelectionID                AS selection_id,
+        b.LastTradedprice            AS last_traded_price,
+        b.Market_TotalMatched        AS total_matched,
+        NULL                         AS status,
+        r.Result                     AS result
+    FROM       TodaysRaces  t
+    LEFT JOIN  BetFairData  b ON  b.Meeting  = t.Meeting
+                              AND b.RaceTime  = t.RaceTime
+                              AND b.Horse     = t.Horse
+    LEFT JOIN  Results      r ON  r.Meeting  = t.Meeting
+                              AND r.RaceTime  = t.RaceTime
+                              AND r.Horse     = t.Horse
 """
 
 # Columns we expect to hand around the pipeline.
@@ -112,7 +131,7 @@ def fetch_from_sqlserver() -> pd.DataFrame:
             server=host,
             user=os.getenv("SQLSERVER_USER"),
             password=os.getenv("SQLSERVER_PASSWORD"),
-            database=os.getenv("SQLSERVER_DB", "PuntersEdgeDB"),
+            database=os.getenv("SQLSERVER_DB", "PuntersEdge"),
         )
         try:
             df = pd.read_sql(SCRAPER_QUERY, conn)
