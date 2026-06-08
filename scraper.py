@@ -62,8 +62,8 @@ def _log(*args):
 def _get(url: str) -> BeautifulSoup | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
+        _log(f"GET {url} -> HTTP {resp.status_code} ({len(resp.content)} bytes)")
         if resp.status_code != 200:
-            _log(f"GET {url} -> HTTP {resp.status_code}")
             return None
         return BeautifulSoup(resp.text, "html.parser")
     except Exception as exc:  # network / parse errors shouldn't kill the run

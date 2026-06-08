@@ -23,5 +23,6 @@ jobs:
         run: python pipeline.py
         env:
           DATA_SOURCE:        punters
+          SCRAPER_DEBUG:      "1"
           SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY:  ${{ secrets.SUPABASE_ANON_KEY }}
