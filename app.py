@@ -1,22 +1,22 @@
 """
 app.py — Apollo racing dashboard (Streamlit).
 
-A PIN-gated dashboard over the Supabase data: overall top-pick win %, today's
-top picks, and win% over time.
+Uses the Supabase HTTP client (supabase-py) instead of psycopg2 to avoid
+TCP/IPv6 connection issues on Streamlit Cloud.
 
-Run:  streamlit run app.py
-
-Config via env / .env:
-    SUPABASE_DB_URL   Supabase Postgres connection string (read-only use here)
-    DASHBOARD_PIN     Optional; defaults to 2828
+Streamlit secrets required:
+    SUPABASE_URL      https://<ref>.supabase.co
+    SUPABASE_ANON_KEY anon/public JWT key
+    DASHBOARD_PIN     optional; defaults to 2828
 """
 
 import os
+from datetime import date
 
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from supabase import create_client
 
 load_dotenv()
 
@@ -30,11 +30,9 @@ st.set_page_config(page_title="Apollo Racing", page_icon="🏇", layout="wide")
 # ---------------------------------------------------------------------------
 
 def require_pin() -> None:
-    """Block the app until the correct PIN is entered."""
     pin = os.getenv("DASHBOARD_PIN", DEFAULT_PIN)
     if st.session_state.get("authed"):
         return
-
     st.title("🏇 Apollo")
     st.caption("Enter PIN to continue")
     entered = st.text_input("PIN", type="password", max_chars=8)
@@ -48,64 +46,88 @@ def require_pin() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Data
+# Supabase HTTP client — no TCP, no IPv6 issues
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
-def get_engine():
-    db_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
-    if not db_url:
-        st.error("SUPABASE_DB_URL is not set. Check your Streamlit secrets.")
+def get_client():
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_ANON_KEY")
+    if not url or not key:
+        st.error("Set SUPABASE_URL and SUPABASE_ANON_KEY in Streamlit secrets.")
         st.stop()
-    # Normalise scheme for SQLAlchemy
-    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
-    if not db_url.startswith("postgresql+"):
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    # Supabase requires SSL
-    if "sslmode" not in db_url:
-        db_url += "?sslmode=require"
-    return create_engine(db_url, pool_pre_ping=True)
+    return create_client(url, key)
 
+
+# ---------------------------------------------------------------------------
+# Data loaders
+# ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=60)
 def load_overview() -> dict:
-    engine = get_engine()
-    with engine.connect() as conn:
-        settled = pd.read_sql(
-            text("""
-                SELECT r.won, e.race_time
-                FROM predictions p
-                JOIN results r       ON r.race_entry_id = p.race_entry_id
-                JOIN race_entries e  ON e.id = p.race_entry_id
-                WHERE p.is_top_pick
-            """),
-            conn,
-        )
-        total_picks = pd.read_sql(
-            text("SELECT COUNT(*) AS n FROM predictions WHERE is_top_pick"), conn
-        )["n"].iloc[0]
-        races = pd.read_sql(
-            text("SELECT COUNT(*) AS n FROM race_entries"), conn
-        )["n"].iloc[0]
-    return {"settled": settled, "total_picks": int(total_picks), "races": int(races)}
+    client = get_client()
+
+    preds_resp = client.table("predictions").select(
+        "race_entry_id, race_entries(race_time)"
+    ).eq("is_top_pick", True).execute()
+    preds = preds_resp.data or []
+    entry_ids = [p["race_entry_id"] for p in preds]
+
+    settled_rows = []
+    if entry_ids:
+        res_resp = client.table("results").select(
+            "race_entry_id, won"
+        ).in_("race_entry_id", entry_ids).execute()
+        results_map = {r["race_entry_id"]: r["won"] for r in (res_resp.data or [])}
+        for p in preds:
+            eid = p["race_entry_id"]
+            if eid in results_map:
+                entry = p.get("race_entries") or {}
+                settled_rows.append({"won": results_map[eid], "race_time": entry.get("race_time")})
+
+    settled = pd.DataFrame(settled_rows)
+    races_resp = client.table("race_entries").select("id", count="exact").execute()
+
+    return {"settled": settled, "total_picks": len(preds), "races": races_resp.count or 0}
 
 
 @st.cache_data(ttl=60)
 def load_today_top_picks() -> pd.DataFrame:
-    engine = get_engine()
-    with engine.connect() as conn:
-        return pd.read_sql(
-            text("""
-                SELECT e.meeting, e.race_number, e.race_time, e.horse,
-                       e.jockey, e.odds, p.win_probability, p.predicted_rank
-                FROM predictions p
-                JOIN race_entries e ON e.id = p.race_entry_id
-                WHERE p.is_top_pick
-                  AND e.race_time::date = CURRENT_DATE
-                ORDER BY e.race_time
-            """),
-            conn,
-        )
+    client = get_client()
+
+    today = date.today().isoformat()
+    entries_resp = client.table("race_entries").select(
+        "id, meeting, race_number, race_time, horse, jockey, odds"
+    ).gte("race_time", f"{today}T00:00:00+00:00").lte(
+        "race_time", f"{today}T23:59:59+00:00"
+    ).execute()
+
+    entries = entries_resp.data or []
+    if not entries:
+        return pd.DataFrame()
+
+    entry_ids = [e["id"] for e in entries]
+    entries_map = {e["id"]: e for e in entries}
+
+    preds_resp = client.table("predictions").select(
+        "race_entry_id, predicted_rank, win_probability"
+    ).eq("is_top_pick", True).in_("race_entry_id", entry_ids).execute()
+
+    rows = []
+    for p in (preds_resp.data or []):
+        e = entries_map.get(p["race_entry_id"], {})
+        rows.append({
+            "meeting":         e.get("meeting"),
+            "race_number":     e.get("race_number"),
+            "race_time":       e.get("race_time"),
+            "horse":           e.get("horse"),
+            "jockey":          e.get("jockey"),
+            "odds":            e.get("odds"),
+            "win_probability": p.get("win_probability"),
+            "predicted_rank":  p.get("predicted_rank"),
+        })
+
+    return pd.DataFrame(rows).sort_values("race_time") if rows else pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +148,11 @@ c2.metric("Top picks made", ov["total_picks"])
 c3.metric("Runners tracked", ov["races"])
 
 st.subheader("Today's top picks")
-today = load_today_top_picks()
-if today.empty:
+today_picks = load_today_top_picks()
+if today_picks.empty:
     st.info("No top picks for today yet — run the pipeline to generate predictions.")
 else:
-    st.dataframe(today, use_container_width=True, hide_index=True)
+    st.dataframe(today_picks, use_container_width=True, hide_index=True)
 
 st.subheader("Win % over time")
 if settled.empty:
