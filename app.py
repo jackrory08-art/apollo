@@ -14,9 +14,9 @@ Config via env / .env:
 import os
 
 import pandas as pd
-import psycopg2
 import streamlit as st
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 
@@ -52,52 +52,60 @@ def require_pin() -> None:
 # ---------------------------------------------------------------------------
 
 @st.cache_resource
-def get_conn():
+def get_engine():
     db_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
     if not db_url:
-        st.error("SUPABASE_DB_URL is not set. See .env.example.")
+        st.error("SUPABASE_DB_URL is not set. Check your Streamlit secrets.")
         st.stop()
-    # Supabase requires SSL; append if not already present
+    # Normalise scheme for SQLAlchemy
+    db_url = db_url.replace("postgres://", "postgresql+psycopg2://", 1)
+    if not db_url.startswith("postgresql+"):
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    # Supabase requires SSL
     if "sslmode" not in db_url:
         db_url += "?sslmode=require"
-    return psycopg2.connect(db_url)
+    return create_engine(db_url, pool_pre_ping=True)
 
 
 @st.cache_data(ttl=60)
 def load_overview() -> dict:
-    conn = get_conn()
-    settled = pd.read_sql(
-        """
-        SELECT r.won, e.race_time
-        FROM predictions p
-        JOIN results r       ON r.race_entry_id = p.race_entry_id
-        JOIN race_entries e  ON e.id = p.race_entry_id
-        WHERE p.is_top_pick
-        """,
-        conn,
-    )
-    total_picks = pd.read_sql(
-        "SELECT COUNT(*) AS n FROM predictions WHERE is_top_pick", conn
-    )["n"].iloc[0]
-    races = pd.read_sql("SELECT COUNT(*) AS n FROM race_entries", conn)["n"].iloc[0]
+    engine = get_engine()
+    with engine.connect() as conn:
+        settled = pd.read_sql(
+            text("""
+                SELECT r.won, e.race_time
+                FROM predictions p
+                JOIN results r       ON r.race_entry_id = p.race_entry_id
+                JOIN race_entries e  ON e.id = p.race_entry_id
+                WHERE p.is_top_pick
+            """),
+            conn,
+        )
+        total_picks = pd.read_sql(
+            text("SELECT COUNT(*) AS n FROM predictions WHERE is_top_pick"), conn
+        )["n"].iloc[0]
+        races = pd.read_sql(
+            text("SELECT COUNT(*) AS n FROM race_entries"), conn
+        )["n"].iloc[0]
     return {"settled": settled, "total_picks": int(total_picks), "races": int(races)}
 
 
 @st.cache_data(ttl=60)
 def load_today_top_picks() -> pd.DataFrame:
-    conn = get_conn()
-    return pd.read_sql(
-        """
-        SELECT e.meeting, e.race_number, e.race_time, e.horse,
-               e.jockey, e.odds, p.win_probability, p.predicted_rank
-        FROM predictions p
-        JOIN race_entries e ON e.id = p.race_entry_id
-        WHERE p.is_top_pick
-          AND e.race_time::date = CURRENT_DATE
-        ORDER BY e.race_time
-        """,
-        conn,
-    )
+    engine = get_engine()
+    with engine.connect() as conn:
+        return pd.read_sql(
+            text("""
+                SELECT e.meeting, e.race_number, e.race_time, e.horse,
+                       e.jockey, e.odds, p.win_probability, p.predicted_rank
+                FROM predictions p
+                JOIN race_entries e ON e.id = p.race_entry_id
+                WHERE p.is_top_pick
+                  AND e.race_time::date = CURRENT_DATE
+                ORDER BY e.race_time
+            """),
+            conn,
+        )
 
 
 # ---------------------------------------------------------------------------
