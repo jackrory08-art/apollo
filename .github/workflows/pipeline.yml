@@ -1,0 +1,29 @@
+name: Racing Pipeline
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # 8am AEST daily (22:00 UTC)
+  workflow_dispatch:        # run manually from GitHub Actions tab anytime
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        run: python pipeline.py
+        env:
+          SUPABASE_DB_URL:    ${{ secrets.SUPABASE_DB_URL }}
+          SQLSERVER_HOST:     ${{ secrets.SQLSERVER_HOST }}
+          SQLSERVER_DB:       ${{ secrets.SQLSERVER_DB }}
+          SQLSERVER_USER:     ${{ secrets.SQLSERVER_USER }}
+          SQLSERVER_PASSWORD: ${{ secrets.SQLSERVER_PASSWORD }}
