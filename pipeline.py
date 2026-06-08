@@ -46,6 +46,8 @@ def supabase_conn():
     db_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
     if not db_url:
         raise SystemExit("ERROR: SUPABASE_DB_URL not set (see .env.example).")
+    if "sslmode" not in db_url:
+        db_url += "?sslmode=require"
     return psycopg2.connect(db_url)
 
 
