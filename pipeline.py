@@ -124,18 +124,22 @@ def fetch_data() -> pd.DataFrame:
     """
     Fetch today's race/runner rows from the configured data source.
 
-    DATA_SOURCE=punters (default) → live scrape of punters.com.au.
-    DATA_SOURCE=sqlserver         → read the legacy PuntersEdge SQL Server DB.
+    DATA_SOURCE=betfair (default) → official Betfair Exchange API (AU racing).
+    DATA_SOURCE=punters           → scrape punters.com.au (blocked by bot
+                                    protection; kept for reference).
+    DATA_SOURCE=sqlserver         → legacy PuntersEdge SQL Server DB.
     """
-    source = os.getenv("DATA_SOURCE", "punters").lower()
-    if source == "sqlserver":
-        return fetch_from_sqlserver()
-
-    from scraper import fetch_from_punters
+    source = os.getenv("DATA_SOURCE", "betfair").lower()
     try:
-        return fetch_from_punters(os.getenv("SCRAPE_DATE") or None)
+        if source == "sqlserver":
+            return fetch_from_sqlserver()
+        if source == "punters":
+            from scraper import fetch_from_punters
+            return fetch_from_punters(os.getenv("SCRAPE_DATE") or None)
+        from betfair import fetch_from_betfair
+        return fetch_from_betfair()
     except Exception as exc:
-        print(f"• Scraper failed ({exc}); continuing without ingest.")
+        print(f"• Data fetch failed ({exc}); continuing without ingest.")
         return pd.DataFrame(columns=ENTRY_COLUMNS + ["result"])
 
 

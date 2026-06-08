@@ -22,7 +22,9 @@ jobs:
       - name: Run pipeline
         run: python pipeline.py
         env:
-          DATA_SOURCE:        punters
-          SCRAPER_DEBUG:      "1"
+          DATA_SOURCE:        betfair
           SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY:  ${{ secrets.SUPABASE_ANON_KEY }}
+          BF_APP_KEY:         ${{ secrets.BF_APP_KEY }}
+          BF_USERNAME:        ${{ secrets.BF_USERNAME }}
+          BF_PASSWORD:        ${{ secrets.BF_PASSWORD }}
