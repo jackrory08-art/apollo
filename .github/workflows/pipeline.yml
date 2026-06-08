@@ -22,9 +22,6 @@ jobs:
       - name: Run pipeline
         run: python pipeline.py
         env:
+          DATA_SOURCE:        punters
           SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY:  ${{ secrets.SUPABASE_ANON_KEY }}
-          SQLSERVER_HOST:     ${{ secrets.SQLSERVER_HOST }}
-          SQLSERVER_DB:       ${{ secrets.SQLSERVER_DB }}
-          SQLSERVER_USER:     ${{ secrets.SQLSERVER_USER }}
-          SQLSERVER_PASSWORD: ${{ secrets.SQLSERVER_PASSWORD }}

@@ -120,6 +120,25 @@ ENTRY_COLUMNS = [
 ]
 
 
+def fetch_data() -> pd.DataFrame:
+    """
+    Fetch today's race/runner rows from the configured data source.
+
+    DATA_SOURCE=punters (default) → live scrape of punters.com.au.
+    DATA_SOURCE=sqlserver         → read the legacy PuntersEdge SQL Server DB.
+    """
+    source = os.getenv("DATA_SOURCE", "punters").lower()
+    if source == "sqlserver":
+        return fetch_from_sqlserver()
+
+    from scraper import fetch_from_punters
+    try:
+        return fetch_from_punters(os.getenv("SCRAPE_DATE") or None)
+    except Exception as exc:
+        print(f"• Scraper failed ({exc}); continuing without ingest.")
+        return pd.DataFrame(columns=ENTRY_COLUMNS + ["result"])
+
+
 def fetch_from_sqlserver() -> pd.DataFrame:
     """
     Read the latest race/runner rows from the PuntersEdge SQL Server DB.
@@ -338,7 +357,7 @@ def top_pick_strike_rate(client) -> tuple[float, int, int]:
 def run() -> None:
     client = get_supabase_client()
 
-    scraped = fetch_from_sqlserver()
+    scraped = fetch_data()
     upsert_race_entries(client, scraped)
 
     if not scraped.empty and "result" in scraped:
