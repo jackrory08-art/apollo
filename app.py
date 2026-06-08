@@ -57,6 +57,9 @@ def get_conn():
     if not db_url:
         st.error("SUPABASE_DB_URL is not set. See .env.example.")
         st.stop()
+    # Supabase requires SSL; append if not already present
+    if "sslmode" not in db_url:
+        db_url += "?sslmode=require"
     return psycopg2.connect(db_url)
 
 
