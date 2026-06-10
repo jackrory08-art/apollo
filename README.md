@@ -1,29 +1,30 @@
-# Apollo — Automated Racing Pipeline
+# Apollo - Automated Racing Pipeline
 
-An on-demand pipeline that ingests racing data from the **PuntersEdge** scraper,
-stores it in **Supabase Postgres**, ranks runners with an **XGBoost** model, and
-serves a **Streamlit** dashboard.
+An on-demand pipeline that ingests Australian racing markets from the
+**official Betfair Exchange API**, stores them in **Supabase Postgres**, ranks
+runners with an **XGBoost** model, and serves a **Streamlit** dashboard.
 
 ## How the pieces fit
 
-```
-PuntersEdge scraper (VB.NET → SQL Server)
-        │  (pipeline.py reads its SQL Server output)
-        ▼
-   Supabase Postgres ──  race_entries ──< predictions
-                                       └─< results
-        │
-        ▼
+```text
+Betfair Exchange API
+        |  (pipeline.py reads AU WIN markets)
+        v
+   Supabase Postgres -- race_entries --< predictions
+                                      \--< results
+        |
+        v
    Streamlit dashboard (app.py)
 ```
 
-> **About the scraper:** `PuntersEdgeScraper` is a Visual Basic .NET app that
-> scrapes Oddschecker + the Betfair API and writes **odds/market fields** to a
-> SQL Server database. It cannot be imported as a Python module, so `pipeline.py`
-> integrates by **reading its SQL Server output**. Form fields (jockey, trainer,
-> weight, barrier, rest days, track condition) are **not** captured by the
-> scraper; the schema and model are built for them and they activate automatically
-> once a form-data source populates those columns.
+> **Betfair auth:** unattended pipeline runs should use Betfair certificate
+> login (`BF_LOGIN_MODE=cert`, `BF_CERT_FILE`, `BF_KEY_FILE`). The interactive
+> login endpoint can be used for local experiments, but the certificate flow is
+> the documented bot/login method for automation.
+
+The legacy PuntersEdge SQL Server and punters.com.au paths are still available
+through `DATA_SOURCE=sqlserver` and `DATA_SOURCE=punters`, but Betfair is the
+default source.
 
 ## Setup
 
@@ -40,12 +41,19 @@ python pipeline.py          # ingest, predict upcoming, settle finished, print s
 streamlit run app.py        # dashboard (PIN: 2828)
 ```
 
+For a specific racing date:
+
+```bash
+SCRAPE_DATE=2026-06-10 python pipeline.py
+```
+
 ## Files
 
-| File             | Purpose                                                      |
-|------------------|-------------------------------------------------------------|
-| `setup_db.py`    | Create the 3 linked Supabase tables with unique constraints |
-| `pipeline.py`    | Ingest → feature-engineer → XGBoost → predictions/results   |
-| `app.py`         | PIN-gated Streamlit dashboard                               |
-| `requirements.txt` | Python dependencies                                       |
-| `.env.example`   | Required environment variables                              |
+| File               | Purpose                                                     |
+|--------------------|-------------------------------------------------------------|
+| `setup_db.py`      | Create the 3 linked Supabase tables with unique constraints |
+| `betfair.py`       | Betfair Exchange API ingestion and market parsing           |
+| `pipeline.py`      | Ingest -> feature-engineer -> XGBoost -> predictions/results |
+| `app.py`           | PIN-gated Streamlit dashboard                              |
+| `requirements.txt` | Python dependencies                                         |
+| `.env.example`     | Required environment variables                              |

@@ -1,33 +1,51 @@
 """
-betfair.py — Australian racing data via the official Betfair Exchange API.
+betfair.py - Australian racing data via the official Betfair Exchange API.
 
-Replaces the blocked punters.com.au scrape with a legitimate, reliable source.
-Betfair returns real AU WIN markets with runners, live odds, traded volume,
-settled winners AND form metadata (jockey, trainer, weight, barrier, days since
-last run) — which powers the model's form features.
+The module returns a DataFrame matching pipeline.py's ENTRY_COLUMNS plus
+"result", so the pipeline can ingest Betfair markets without depending on the
+legacy PuntersEdge SQL Server scrape.
 
-Returns a pandas DataFrame matching pipeline.py's ENTRY_COLUMNS + "result".
+Auth:
+    BF_APP_KEY
+    BF_USERNAME
+    BF_PASSWORD
 
-Auth (set as env / GitHub secrets):
-    BF_APP_KEY    Betfair Application Key (a free "delayed" key is fine)
-    BF_USERNAME   Betfair account username
-    BF_PASSWORD   Betfair account password
-    BF_IDENTITY_URL (optional) override login host; AU accounts may need
-                    https://identitysso.betfair.com.au/api/login
+Recommended unattended auth:
+    BF_LOGIN_MODE=cert
+    BF_CERT_FILE=/path/to/client-2048.crt
+    BF_KEY_FILE=/path/to/client-2048.key
 
-Docs: https://developer.betfair.com/  (Sports API, Exchange Betting)
+For local testing only, BF_LOGIN_MODE=interactive can use the interactive SSO
+endpoint without a client certificate. Betfair's documented unattended/bot
+flow uses certificate login.
+
+Docs:
+    https://developer.betfair.com/
+    https://betfair-developer-docs.atlassian.net/wiki/spaces/1smk3cen4v3lu3yomq5qye0ni/pages/2687915/Non-Interactive+bot+login
 """
+
+from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timedelta, timezone
+import re
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
 import requests
 
-IDENTITY_URL = os.getenv("BF_IDENTITY_URL", "https://identitysso.betfair.com/api/login")
-BETTING_URL = "https://api.betfair.com/exchange/betting/json-rpc/v1"
-EVENT_TYPE_HORSE = "7"
+BETTING_URL = os.getenv("BF_BETTING_URL", "https://api.betfair.com/exchange/betting/json-rpc/v1")
+CERT_IDENTITY_URL = os.getenv(
+    "BF_CERT_IDENTITY_URL",
+    os.getenv("BF_IDENTITY_URL", "https://identitysso-cert.betfair.com/api/certlogin"),
+)
+INTERACTIVE_IDENTITY_URL = os.getenv(
+    "BF_INTERACTIVE_IDENTITY_URL",
+    "https://identitysso.betfair.com/api/login",
+)
+EVENT_TYPE_HORSE = os.getenv("BF_EVENT_TYPE_ID", "7")
+DEFAULT_TIMEZONE = os.getenv("BF_TIMEZONE", "Australia/Sydney")
 DEBUG = os.getenv("BF_DEBUG") == "1"
 
 ENTRY_COLUMNS = [
@@ -38,22 +56,99 @@ ENTRY_COLUMNS = [
 ]
 
 
-def _log(*args):
+def _log(*args) -> None:
     if DEBUG:
         print("[betfair]", *args)
+
+
+def _csv_env(name: str, default: str) -> list[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}.") from exc
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Set {name} in your environment or .env file.")
+    return value
+
+
+def _local_zone() -> ZoneInfo:
+    try:
+        return ZoneInfo(DEFAULT_TIMEZONE)
+    except ZoneInfoNotFoundError:
+        _log(f"unknown timezone {DEFAULT_TIMEZONE!r}; falling back to UTC")
+        return ZoneInfo("UTC")
+
+
+def _day_window(day: str | None) -> tuple[str, str]:
+    """Return Betfair UTC ISO bounds for one local racing date."""
+    zone = _local_zone()
+    racing_day = date.fromisoformat(day) if day else datetime.now(zone).date()
+    start_local = datetime.combine(racing_day, time.min, zone)
+    end_local = datetime.combine(racing_day, time.max, zone)
+    start_utc = start_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    end_utc = end_local.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return start_utc, end_utc
 
 
 # ---------------------------------------------------------------------------
 # Auth + JSON-RPC
 # ---------------------------------------------------------------------------
 
-def login() -> str:
-    app_key = os.environ["BF_APP_KEY"]
+def _cert_argument() -> str | tuple[str, str]:
+    cert_file = os.getenv("BF_CERT_FILE") or os.getenv("BF_CERT_PATH") or os.getenv("BF_CERT_PEM")
+    key_file = os.getenv("BF_KEY_FILE") or os.getenv("BF_KEY_PATH")
+
+    if cert_file and key_file:
+        return cert_file, key_file
+    if cert_file:
+        return cert_file
+
+    raise RuntimeError(
+        "BF_LOGIN_MODE=cert requires BF_CERT_FILE plus BF_KEY_FILE, or one PEM "
+        "file containing both the certificate and private key."
+    )
+
+
+def cert_login() -> str:
+    """Login using Betfair's certificate-based non-interactive flow."""
     resp = requests.post(
-        IDENTITY_URL,
-        data={"username": os.environ["BF_USERNAME"], "password": os.environ["BF_PASSWORD"]},
+        CERT_IDENTITY_URL,
+        data={"username": _required_env("BF_USERNAME"), "password": _required_env("BF_PASSWORD")},
         headers={
-            "X-Application": app_key,
+            "X-Application": _required_env("BF_APP_KEY"),
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        cert=_cert_argument(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("loginStatus") != "SUCCESS":
+        raise RuntimeError(f"Betfair certificate login failed: {body.get('loginStatus') or body}")
+    _log("certificate login OK")
+    return body["sessionToken"]
+
+
+def interactive_login() -> str:
+    """Login via the interactive SSO endpoint. Useful for local development."""
+    resp = requests.post(
+        INTERACTIVE_IDENTITY_URL,
+        data={"username": _required_env("BF_USERNAME"), "password": _required_env("BF_PASSWORD")},
+        headers={
+            "X-Application": _required_env("BF_APP_KEY"),
             "Accept": "application/json",
             "Content-Type": "application/x-www-form-urlencoded",
         },
@@ -62,18 +157,34 @@ def login() -> str:
     resp.raise_for_status()
     body = resp.json()
     if body.get("status") != "SUCCESS":
-        raise RuntimeError(f"Betfair login failed: {body.get('error') or body}")
-    _log("login OK")
+        raise RuntimeError(f"Betfair interactive login failed: {body.get('error') or body}")
+    _log("interactive login OK")
     return body["token"]
 
 
+def login() -> str:
+    mode = os.getenv("BF_LOGIN_MODE", "auto").strip().lower()
+    if mode == "auto":
+        mode = "cert" if (os.getenv("BF_CERT_FILE") or os.getenv("BF_CERT_PEM")) else "interactive"
+    if mode == "cert":
+        return cert_login()
+    if mode == "interactive":
+        return interactive_login()
+    raise RuntimeError("BF_LOGIN_MODE must be one of: auto, cert, interactive.")
+
+
 def _rpc(method: str, params: dict, token: str):
-    payload = {"jsonrpc": "2.0", "method": f"SportsAPING/v1.0/{method}", "params": params, "id": 1}
+    payload = {
+        "jsonrpc": "2.0",
+        "method": f"SportsAPING/v1.0/{method}",
+        "params": params,
+        "id": 1,
+    }
     resp = requests.post(
         BETTING_URL,
         data=json.dumps(payload),
         headers={
-            "X-Application": os.environ["BF_APP_KEY"],
+            "X-Application": _required_env("BF_APP_KEY"),
             "X-Authentication": token,
             "Content-Type": "application/json",
             "Accept": "application/json",
@@ -91,38 +202,36 @@ def _rpc(method: str, params: dict, token: str):
 # Market discovery + book
 # ---------------------------------------------------------------------------
 
-def list_markets(token: str) -> list[dict]:
-    """All AU horse-racing WIN markets for today, with runners + form metadata."""
-    now = datetime.now(timezone.utc)
-    end = now.replace(hour=23, minute=59, second=59)
+def list_markets(token: str, day: str | None = None) -> list[dict]:
+    """All configured horse-racing WIN markets for a local racing date."""
+    start_utc, end_utc = _day_window(day)
     params = {
         "filter": {
             "eventTypeIds": [EVENT_TYPE_HORSE],
-            "marketCountries": ["AU"],
-            "marketTypeCodes": ["WIN"],
-            # Include earlier today so already-run races come back for results.
-            "marketStartTime": {
-                "from": now.replace(hour=0, minute=0, second=0).isoformat(),
-                "to": end.isoformat(),
-            },
+            "marketCountries": _csv_env("BF_MARKET_COUNTRIES", "AU"),
+            "marketTypeCodes": _csv_env("BF_MARKET_TYPES", "WIN"),
+            "marketStartTime": {"from": start_utc, "to": end_utc},
         },
         "marketProjection": [
             "MARKET_START_TIME", "EVENT", "RUNNER_DESCRIPTION", "RUNNER_METADATA",
         ],
         "sort": "FIRST_TO_START",
-        "maxResults": 200,
+        "maxResults": _int_env("BF_MAX_RESULTS", 200),
     }
     markets = _rpc("listMarketCatalogue", params, token)
-    _log(f"{len(markets)} AU WIN markets today")
+    _log(f"{len(markets)} markets from {start_utc} to {end_utc}")
     return markets
 
 
-def list_books(token: str, market_ids: list[str]) -> dict:
+def list_books(token: str, market_ids: list[str]) -> dict[str, dict]:
     """Map market_id -> marketBook (prices + settlement status), batched."""
     books: dict[str, dict] = {}
     for i in range(0, len(market_ids), 25):
         batch = market_ids[i:i + 25]
-        params = {"marketIds": batch, "priceProjection": {"priceData": ["EX_BEST_OFFERS"]}}
+        params = {
+            "marketIds": batch,
+            "priceProjection": {"priceData": ["EX_BEST_OFFERS", "EX_TRADED"]},
+        }
         for book in _rpc("listMarketBook", params, token):
             books[book["marketId"]] = book
     return books
@@ -147,17 +256,16 @@ def _float(value):
 
 
 def _race_number(market_name: str) -> int:
-    import re
-    m = re.search(r"R(?:ace)?\s*(\d+)", market_name or "", re.IGNORECASE)
-    return _int(m.group(1)) if m else 0
+    match = re.search(r"\bR(?:ace)?\s*(\d+)\b", market_name or "", re.IGNORECASE)
+    return _int(match.group(1)) if match else 0
 
 
 def _distance(market_name: str, meta: dict):
-    import re
-    if meta.get("RACE_TYPE") and (d := _int(meta.get("DISTANCE"))):
-        return d
-    m = re.search(r"(\d{3,4})\s*m", market_name or "", re.IGNORECASE)
-    return _int(m.group(1)) if m else None
+    meta_distance = _int(meta.get("DISTANCE"))
+    if meta_distance:
+        return meta_distance
+    match = re.search(r"(\d{3,4})\s*m\b", market_name or "", re.IGNORECASE)
+    return _int(match.group(1)) if match else None
 
 
 def _last_start_date(race_time_iso: str | None, meta: dict):
@@ -171,57 +279,53 @@ def _last_start_date(race_time_iso: str | None, meta: dict):
         return None
 
 
+def _best_back_price(runner_book: dict):
+    ex = runner_book.get("ex", {})
+    available = ex.get("availableToBack") or []
+    if available:
+        return available[0].get("price")
+    return runner_book.get("lastPriceTraded")
+
+
+def _result_from_status(market_closed: bool, runner_status: str | None):
+    if runner_status == "WINNER":
+        return 1
+    if market_closed and runner_status == "LOSER":
+        return 2
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def fetch_from_betfair(_day: str | None = None) -> pd.DataFrame:
-    """Pull today's AU WIN markets into the pipeline's race_entries schema.
-
-    `result`: 1 for the settled winner, 2 for any settled (beaten) runner, None
-    while the market is still open. Betfair exposes winner/loser, not full
-    placings, so beaten runners carry won=False with an approximate position —
-    enough for the top-pick strike rate, which keys off the winner.
-    """
+def fetch_from_betfair(day: str | None = None) -> pd.DataFrame:
+    """Pull configured Betfair horse-racing markets into race_entries shape."""
     token = login()
-    markets = list_markets(token)
+    markets = list_markets(token, day)
     if not markets:
-        print("• Betfair returned no AU WIN markets for today.")
+        print("* Betfair returned no matching markets.")
         return pd.DataFrame(columns=ENTRY_COLUMNS + ["result"])
 
-    market_ids = [m["marketId"] for m in markets]
+    market_ids = [market["marketId"] for market in markets]
     books = list_books(token, market_ids)
 
     rows: list[dict] = []
     for market in markets:
-        mid = market["marketId"]
+        market_id = market["marketId"]
         event = market.get("event", {})
         meeting = event.get("venue") or event.get("name")
         market_name = market.get("marketName", "")
         race_time = market.get("marketStartTime")
-        book = books.get(mid, {})
+        book = books.get(market_id, {})
         market_closed = book.get("status") == "CLOSED"
-
-        # selectionId -> runner book entry (prices + status)
-        book_runners = {r["selectionId"]: r for r in book.get("runners", [])}
+        book_runners = {runner["selectionId"]: runner for runner in book.get("runners", [])}
 
         for runner in market.get("runners", []):
-            sid = runner["selectionId"]
+            selection_id = runner["selectionId"]
             meta = runner.get("metadata", {}) or {}
-            br = book_runners.get(sid, {})
-
-            best_back = None
-            ex = br.get("ex", {})
-            if ex.get("availableToBack"):
-                best_back = ex["availableToBack"][0].get("price")
-
-            r_status = br.get("status")  # ACTIVE / WINNER / LOSER / REMOVED
-            if r_status == "WINNER":
-                result = 1
-            elif market_closed and r_status == "LOSER":
-                result = 2
-            else:
-                result = None
+            runner_book = book_runners.get(selection_id, {})
+            runner_status = runner_book.get("status")
 
             rows.append({
                 "meeting": meeting,
@@ -235,23 +339,26 @@ def fetch_from_betfair(_day: str | None = None) -> pd.DataFrame:
                 "trainer": meta.get("TRAINER_NAME"),
                 "weight": _float(meta.get("WEIGHT_VALUE")),
                 "last_start_date": _last_start_date(race_time, meta),
-                "odds": best_back,
+                "odds": _best_back_price(runner_book),
                 "bookmaker": "betfair",
-                "selection_id": sid,
-                "last_traded_price": br.get("lastPriceTraded"),
-                "total_matched": br.get("totalMatched"),
-                "status": r_status,
-                "result": result,
+                "selection_id": selection_id,
+                "last_traded_price": runner_book.get("lastPriceTraded"),
+                "total_matched": runner_book.get("totalMatched"),
+                "status": runner_status,
+                "result": _result_from_status(market_closed, runner_status),
             })
 
     df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=ENTRY_COLUMNS + ["result"])
+
     df = df.drop_duplicates(
         subset=["meeting", "race_number", "race_time", "horse"]
     ).reset_index(drop=True)
     n_races = df[["meeting", "race_number", "race_time"]].drop_duplicates().shape[0]
-    print(f"• Betfair: {len(df)} runners across {n_races} AU races.")
+    print(f"* Betfair: {len(df)} runners across {n_races} races.")
     return df[ENTRY_COLUMNS + ["result"]]
 
 
 if __name__ == "__main__":
-    print(fetch_from_betfair().head(20).to_string())
+    print(fetch_from_betfair(os.getenv("SCRAPE_DATE") or None).head(20).to_string())

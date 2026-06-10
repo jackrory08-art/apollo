@@ -130,6 +130,24 @@ def load_today_top_picks() -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("race_time") if rows else pd.DataFrame()
 
 
+@st.cache_data(ttl=60)
+def load_today_market_rows() -> pd.DataFrame:
+    client = get_client()
+
+    today = date.today().isoformat()
+    entries_resp = client.table("race_entries").select(
+        "meeting, race_number, race_time, horse, jockey, trainer, odds, "
+        "last_traded_price, total_matched, status, bookmaker"
+    ).gte("race_time", f"{today}T00:00:00+00:00").lte(
+        "race_time", f"{today}T23:59:59+00:00"
+    ).execute()
+
+    rows = entries_resp.data or []
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["race_time", "meeting", "race_number", "horse"])
+
+
 # ---------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------
@@ -153,6 +171,17 @@ if today_picks.empty:
     st.info("No top picks for today yet — run the pipeline to generate predictions.")
 else:
     st.dataframe(today_picks, use_container_width=True, hide_index=True)
+
+st.subheader("Betfair market watch")
+market_rows = load_today_market_rows()
+if market_rows.empty:
+    st.info("No Betfair market rows for today yet.")
+else:
+    total_matched = pd.to_numeric(
+        market_rows.get("total_matched"), errors="coerce"
+    ).fillna(0).sum()
+    st.caption(f"{len(market_rows)} runners tracked | total matched ${total_matched:,.0f}")
+    st.dataframe(market_rows, use_container_width=True, hide_index=True)
 
 st.subheader("Win % over time")
 if settled.empty:

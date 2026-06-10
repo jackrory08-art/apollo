@@ -3,9 +3,9 @@ pipeline.py — Apollo unified on-demand racing pipeline.
 
 Flow
 ----
-1. Pull race/runner/odds/result rows from the PuntersEdge scraper's SQL Server DB
-   (the VB.NET app is not importable into Python, so its SQL Server output is the
-   integration seam — triggering a fresh scrape means running the VB .exe).
+1. Pull race/runner/odds/result rows from the configured data source. Betfair
+   Exchange API is the default and recommended source for Australian WIN
+   markets.
 2. Upsert those rows into Supabase `race_entries` via the HTTP client (no TCP/IPv6).
 3. For each race:
      - upcoming  → engineer form features, run the XGBoost model, write `predictions`
@@ -16,13 +16,11 @@ Run:  python pipeline.py
 
 Config via env / .env (see .env.example):
     SUPABASE_URL, SUPABASE_ANON_KEY,
-    SQLSERVER_HOST, SQLSERVER_DB, SQLSERVER_USER, SQLSERVER_PASSWORD
+    BF_APP_KEY, BF_USERNAME, BF_PASSWORD, BF_LOGIN_MODE
 
-NOTE: The SQL Server source only carries odds/market fields. The form features
-(jockey/trainer combo, weight shift, rest days, track-condition suitability) are
-written to operate on the schema's form columns and degrade gracefully to neutral
-defaults while those columns are empty — they sharpen automatically once a
-form-data source populates them.
+NOTE: Betfair runner metadata can populate form columns where available. The
+feature code still degrades gracefully to neutral defaults when any field is
+missing.
 """
 
 import os
@@ -68,7 +66,7 @@ def _clean(val):
 
 
 # ---------------------------------------------------------------------------
-# 1. Fetch from the scraper's SQL Server output
+# 1. Fetch from the configured market-data source
 # ---------------------------------------------------------------------------
 
 # Column mapping: scraper field  ->  our race_entries column.
@@ -137,7 +135,7 @@ def fetch_data() -> pd.DataFrame:
             from scraper import fetch_from_punters
             return fetch_from_punters(os.getenv("SCRAPE_DATE") or None)
         from betfair import fetch_from_betfair
-        return fetch_from_betfair()
+        return fetch_from_betfair(os.getenv("SCRAPE_DATE") or None)
     except Exception as exc:
         print(f"• Data fetch failed ({exc}); continuing without ingest.")
         return pd.DataFrame(columns=ENTRY_COLUMNS + ["result"])
