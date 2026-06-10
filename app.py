@@ -87,8 +87,18 @@ def load_overview() -> dict:
 
     settled = pd.DataFrame(settled_rows)
     races_resp = client.table("race_entries").select("id", count="exact").execute()
+    try:
+        history_resp = client.table("horse_history").select("id", count="exact").execute()
+        history_count = history_resp.count or 0
+    except Exception:
+        history_count = 0
 
-    return {"settled": settled, "total_picks": len(preds), "races": races_resp.count or 0}
+    return {
+        "settled": settled,
+        "total_picks": len(preds),
+        "races": races_resp.count or 0,
+        "history": history_count,
+    }
 
 
 @st.cache_data(ttl=60)
@@ -160,10 +170,11 @@ ov = load_overview()
 settled = ov["settled"]
 win_rate = settled["won"].mean() if not settled.empty else 0.0
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Top-pick win %", f"{win_rate:.1%}")
 c2.metric("Top picks made", ov["total_picks"])
 c3.metric("Runners tracked", ov["races"])
+c4.metric("History starts", ov["history"])
 
 st.subheader("Today's top picks")
 today_picks = load_today_top_picks()

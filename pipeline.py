@@ -31,9 +31,15 @@ import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
 
+from history import (
+    HISTORY_COLUMNS,
+    fetch_external_history,
+    observed_history_from_results,
+)
+
 load_dotenv()
 
-MODEL_VERSION = "v1"
+MODEL_VERSION = "v2"
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +124,12 @@ ENTRY_COLUMNS = [
 ]
 
 
+def _horse_key(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip().upper()
+
+
 def fetch_data() -> pd.DataFrame:
     """
     Fetch today's race/runner rows from the configured data source.
@@ -192,6 +204,22 @@ def upsert_race_entries(client, df: pd.DataFrame) -> None:
     print(f"• Upserted {len(records)} race entries.")
 
 
+def upsert_horse_history(client, df: pd.DataFrame) -> None:
+    if df.empty:
+        return
+    records = [
+        {col: _clean(row[col]) for col in HISTORY_COLUMNS}
+        for _, row in df[HISTORY_COLUMNS].iterrows()
+    ]
+    try:
+        client.table("horse_history").upsert(
+            records, on_conflict="source,horse,race_time,meeting"
+        ).execute()
+        print(f"• Upserted {len(records)} horse-history starts.")
+    except Exception as exc:
+        print(f"• Could not write horse_history ({exc}). Run setup_db.py after adding SUPABASE_DB_URL.")
+
+
 # ---------------------------------------------------------------------------
 # 3a. Feature engineering
 # ---------------------------------------------------------------------------
@@ -199,10 +227,70 @@ def upsert_race_entries(client, df: pd.DataFrame) -> None:
 FEATURE_COLUMNS = [
     "odds_implied_prob", "market_support", "jockey_trainer_combo",
     "weight_shift", "rest_days", "track_condition_suitability",
+    "horse_history_starts", "horse_history_win_rate",
+    "horse_history_place_rate", "horse_history_avg_finish",
+    "horse_history_best_finish", "horse_history_days_since_run",
+    "distance_history_win_rate", "track_history_win_rate",
+    "going_history_win_rate",
 ]
 
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+def _history_feature_rows(df: pd.DataFrame, history: pd.DataFrame | None) -> pd.DataFrame:
+    columns = [
+        "horse_history_starts", "horse_history_win_rate",
+        "horse_history_place_rate", "horse_history_avg_finish",
+        "horse_history_best_finish", "horse_history_days_since_run",
+        "distance_history_win_rate", "track_history_win_rate",
+        "going_history_win_rate",
+    ]
+    defaults = pd.DataFrame(0.0, index=df.index, columns=columns)
+    if history is None or history.empty:
+        return defaults
+
+    hist = history.copy()
+    hist["horse_key"] = hist["horse"].map(_horse_key)
+    hist["race_time"] = pd.to_datetime(hist["race_time"], errors="coerce", utc=True)
+    hist["finishing_position"] = pd.to_numeric(hist.get("finishing_position"), errors="coerce")
+    hist["won"] = hist.get("won", pd.Series(False, index=hist.index)).fillna(False).astype(bool)
+    hist["placed"] = hist["finishing_position"].le(3)
+
+    rows = []
+    for _, row in df.iterrows():
+        horse = _horse_key(row.get("horse"))
+        race_time = pd.to_datetime(row.get("race_time"), errors="coerce", utc=True)
+        past = hist[(hist["horse_key"] == horse) & (hist["race_time"] < race_time)]
+        if past.empty:
+            rows.append({col: 0.0 for col in columns})
+            continue
+
+        past = past.sort_values("race_time")
+        valid_finish = past["finishing_position"].dropna()
+        row_distance = pd.to_numeric(row.get("distance"), errors="coerce")
+        same_distance = past[pd.to_numeric(past.get("distance"), errors="coerce").eq(row_distance)]
+        same_track = past[past.get("meeting").fillna("").str.upper().eq(
+            str(row.get("meeting") or "").upper()
+        )]
+        same_going = past[past.get("track_condition").fillna("").str.upper().eq(
+            str(row.get("track_condition") or "").upper()
+        )]
+        days_since = (race_time - past.iloc[-1]["race_time"]).days if pd.notna(race_time) else 0
+
+        rows.append({
+            "horse_history_starts": float(len(past)),
+            "horse_history_win_rate": float(past["won"].mean()),
+            "horse_history_place_rate": float(past["placed"].fillna(False).mean()),
+            "horse_history_avg_finish": float(valid_finish.mean()) if not valid_finish.empty else 0.0,
+            "horse_history_best_finish": float(valid_finish.min()) if not valid_finish.empty else 0.0,
+            "horse_history_days_since_run": float(max(days_since, 0)),
+            "distance_history_win_rate": float(same_distance["won"].mean()) if not same_distance.empty else 0.0,
+            "track_history_win_rate": float(same_track["won"].mean()) if not same_track.empty else 0.0,
+            "going_history_win_rate": float(same_going["won"].mean()) if not same_going.empty else 0.0,
+        })
+
+    return pd.DataFrame(rows, index=df.index, columns=columns).fillna(0.0)
+
+
+def engineer_features(df: pd.DataFrame, history: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Build model features from a frame of race_entries rows.
     NaN-safe: falls back to neutral values where form columns are missing.
@@ -234,6 +322,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         f["track_condition_suitability"] = pd.Series(cond_strike, index=df.index).fillna(0.0)
     else:
         f["track_condition_suitability"] = 0.0
+
+    hist_features = _history_feature_rows(df, history)
+    for col in hist_features.columns:
+        f[col] = hist_features[col]
 
     return f[FEATURE_COLUMNS].astype(float)
 
@@ -295,6 +387,16 @@ def load_entries(client) -> pd.DataFrame:
         df["finishing_position"] = None
 
     return df
+
+
+def load_horse_history(client) -> pd.DataFrame:
+    try:
+        resp = client.table("horse_history").select("*").limit(10000).execute()
+    except Exception as exc:
+        print(f"• Could not read horse_history ({exc}); using market-only features.")
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
+    rows = resp.data or []
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=HISTORY_COLUMNS)
 
 
 def write_predictions(client, race_entry_ids, ranks, probs, top_pick_id) -> None:
@@ -361,6 +463,8 @@ def run() -> None:
 
     scraped = fetch_data()
     upsert_race_entries(client, scraped)
+    if not scraped.empty:
+        upsert_horse_history(client, fetch_external_history(scraped))
 
     if not scraped.empty and "result" in scraped:
         entries = load_entries(client)
@@ -372,8 +476,10 @@ def run() -> None:
                 how="inner",
             )
             write_results(client, merged)
+            upsert_horse_history(client, observed_history_from_results(finished_scraped))
 
     entries = load_entries(client)
+    history = load_horse_history(client)
     if entries.empty:
         print("• No race entries in the database yet.")
     else:
@@ -383,7 +489,7 @@ def run() -> None:
         settled = entries[entries["won"].notna()]
         model = RacingModel()
         if not settled.empty:
-            model.train(engineer_features(settled), settled["won"].fillna(False))
+            model.train(engineer_features(settled, history), settled["won"].fillna(False))
         else:
             model.train(pd.DataFrame(), pd.Series(dtype=int))
 
@@ -392,7 +498,7 @@ def run() -> None:
         for _, grp in upcoming.groupby(["meeting", "race_number", "race_time"]):
             if grp.empty:
                 continue
-            feats = engineer_features(grp)
+            feats = engineer_features(grp, history)
             probs = model.win_probability(feats)
             order = np.argsort(-probs)
             ranks = np.empty(len(probs), dtype=int)
