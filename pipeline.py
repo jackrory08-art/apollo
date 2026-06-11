@@ -48,9 +48,12 @@ MODEL_VERSION = "v2"
 
 def get_supabase_client():
     url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_ANON_KEY")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
     if not url or not key:
-        raise SystemExit("ERROR: set SUPABASE_URL and SUPABASE_ANON_KEY (see .env.example).")
+        raise SystemExit(
+            "ERROR: set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY "
+            "for backend writes (see .env.example)."
+        )
     return create_client(url, key)
 
 
@@ -253,17 +256,24 @@ def _history_feature_rows(df: pd.DataFrame, history: pd.DataFrame | None) -> pd.
     hist["finishing_position"] = pd.to_numeric(hist.get("finishing_position"), errors="coerce")
     hist["won"] = hist.get("won", pd.Series(False, index=hist.index)).fillna(False).astype(bool)
     hist["placed"] = hist["finishing_position"].le(3)
+    history_by_horse = {
+        horse: grp.sort_values("race_time")
+        for horse, grp in hist.dropna(subset=["race_time"]).groupby("horse_key")
+    }
 
     rows = []
     for _, row in df.iterrows():
         horse = _horse_key(row.get("horse"))
         race_time = pd.to_datetime(row.get("race_time"), errors="coerce", utc=True)
-        past = hist[(hist["horse_key"] == horse) & (hist["race_time"] < race_time)]
+        horse_history = history_by_horse.get(horse)
+        if horse_history is None:
+            rows.append({col: 0.0 for col in columns})
+            continue
+        past = horse_history[horse_history["race_time"] < race_time]
         if past.empty:
             rows.append({col: 0.0 for col in columns})
             continue
 
-        past = past.sort_values("race_time")
         valid_finish = past["finishing_position"].dropna()
         row_distance = pd.to_numeric(row.get("distance"), errors="coerce")
         same_distance = past[pd.to_numeric(past.get("distance"), errors="coerce").eq(row_distance)]
@@ -366,18 +376,28 @@ class RacingModel:
 # Data access helpers
 # ---------------------------------------------------------------------------
 
+def fetch_all_rows(client, table: str, columns: str = "*", page_size: int = 1000) -> list[dict]:
+    rows: list[dict] = []
+    start = 0
+    while True:
+        resp = client.table(table).select(columns).range(
+            start, start + page_size - 1
+        ).execute()
+        page = resp.data or []
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        start += page_size
+
+
 def load_entries(client) -> pd.DataFrame:
     """Load all race_entries, left-joined with any known results."""
-    entries_resp = client.table("race_entries").select("*").execute()
-    entries = entries_resp.data or []
+    entries = fetch_all_rows(client, "race_entries", "*")
     if not entries:
         return pd.DataFrame()
 
     df = pd.DataFrame(entries)
-    results_resp = client.table("results").select(
-        "race_entry_id, won, finishing_position"
-    ).execute()
-    results = results_resp.data or []
+    results = fetch_all_rows(client, "results", "race_entry_id, won, finishing_position")
 
     if results:
         rdf = pd.DataFrame(results)
@@ -391,11 +411,10 @@ def load_entries(client) -> pd.DataFrame:
 
 def load_horse_history(client) -> pd.DataFrame:
     try:
-        resp = client.table("horse_history").select("*").limit(10000).execute()
+        rows = fetch_all_rows(client, "horse_history", "*")
     except Exception as exc:
         print(f"• Could not read horse_history ({exc}); using market-only features.")
         return pd.DataFrame(columns=HISTORY_COLUMNS)
-    rows = resp.data or []
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=HISTORY_COLUMNS)
 
 

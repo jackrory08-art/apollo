@@ -45,6 +45,20 @@ The live Betfair Exchange API gives current markets, runners, odds, volume, and
 settlement status. Full career form usually requires a separate racing form
 provider or a historical export.
 
+## Betfair Historical Import
+
+Betfair BASIC historical archives can backfill old AU WIN markets:
+
+```bash
+python import_betfair_history.py --tar C:\path\to\data.tar --dry-run
+python import_betfair_history.py --tar C:\path\to\data.tar
+```
+
+The importer writes `race_entries`, `results`, and `horse_history`, so backend
+runs need `SUPABASE_SERVICE_ROLE_KEY` in `.env`. The public anon key is still
+fine for the dashboard, but Supabase row-level security blocks historical
+imports with anon-only credentials.
+
 ## Setup
 
 ```bash
@@ -73,6 +87,7 @@ SCRAPE_DATE=2026-06-10 python pipeline.py
 | `setup_db.py`      | Create the Supabase tables with unique constraints          |
 | `betfair.py`       | Betfair Exchange API ingestion and market parsing           |
 | `history.py`       | Horse-history import and normalization helpers              |
+| `import_betfair_history.py` | Betfair BASIC historical archive importer          |
 | `pipeline.py`      | Ingest -> feature-engineer -> XGBoost -> predictions/results |
 | `app.py`           | PIN-gated Streamlit dashboard                              |
 | `requirements.txt` | Python dependencies                                         |
